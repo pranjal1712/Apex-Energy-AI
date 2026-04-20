@@ -78,5 +78,5 @@ jobs:
 
       - name: Verify Deployment
         run: |
-          kubectl rollout status deployment/apex-backend -n apex-energy
-          kubectl rollout status deployment/apex-frontend -n apex-energy
+          kubectl rollout status deployment/apex-backend -n apex-energy --insecure-skip-tls-verify
+          kubectl rollout status deployment/apex-frontend -n apex-energy --insecure-skip-tls-verify
