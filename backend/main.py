@@ -1,0 +1,712 @@
+from dotenv import load_dotenv
+import os
+import json
+# Load environment variables from the root .env file
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Response, Request
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from concurrent.futures import ThreadPoolExecutor
+from auth import (
+    User, create_user, get_user_by_email, verify_password, 
+    create_access_token, verify_google_token, verify_google_access_token,
+    create_password_reset_token, get_email_from_reset_token, delete_reset_token, 
+    get_password_hash, decode_access_token
+)
+from rag import ingest_document, retrieve_and_rerank, generate_response
+from research_chain import run_full_research
+import tempfile
+import uuid
+import os
+
+app = FastAPI(title="Apex Energy AI")
+
+# Environment-aware cookie settings
+IS_PROD = os.getenv("ENVIRONMENT") == "production"
+COOKIE_SECURE = True if IS_PROD else False
+COOKIE_SAMESITE = "none" if IS_PROD else "lax"
+
+print(f"[AUTH INIT] Environment: {os.getenv('ENVIRONMENT', 'local')} | Secure: {COOKIE_SECURE} | SameSite: {COOKIE_SAMESITE}")
+
+# Setup CORS - Use specific origin for cookies
+raw_origins = os.getenv(
+    "ALLOWED_ORIGINS", 
+    "https://enerlytics-ai-fawn.vercel.app,https://enerlytics-ai-snowy.vercel.app,http://localhost:3000,http://localhost:5173"
+).split(",")
+
+# Strip spaces AND trailing slashes for robust matching
+origins = [o.strip().rstrip("/") for o in raw_origins if o.strip()]
+print(f"[CORS INIT] Allowed Origins: {origins}")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"]
+)
+
+@app.on_event("startup")
+def startup_event():
+    import threading
+    from db import init_qdrant, ensure_collections
+    
+    print("[STARTUP] Initializing Services...")
+    
+    # 1. Fast Client Init (No blocking network calls)
+    client = init_qdrant()
+    
+    # 2. Ensure Collections (Run in background to avoid blocking main thread)
+    if client:
+        threading.Thread(target=ensure_collections, daemon=True).start()
+    
+    # 3. AI Model Pre-warming (Run in Background Thread)
+    # This loads the 400MB SentenceTransformer while the server starts up
+    def prewarm():
+        from rag import get_embedding_model
+        get_embedding_model()
+    threading.Thread(target=prewarm, daemon=True).start()
+    
+    # 4. Test Redis Connectivity (Blocking but fast)
+    try:
+        from db import redis_client
+        redis_client.ping()
+        print("[INFO] Redis Connectivity: OK")
+    except Exception as e:
+        print(f"[ERROR] Redis Connectivity Failed: {e}")
+    
+    print("[SUCCESS] API is ready and listening.")
+
+@app.post("/auth/signup")
+async def signup(request: Request, response: Response, user: User):
+    from db import rate_limit_check, redis_client
+    from mail_utils import mail_handler
+    import random
+    
+    if not rate_limit_check(user.email, limit=5, period_hours=1):
+        raise HTTPException(status_code=429, detail="Too many signup attempts. Please try again in an hour.")
+        
+    if get_user_by_email(user.email):
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # Generate 6-digit OTP
+    otp = str(random.randint(100000, 999999))
+    
+    # Store USER DATA temporarily in Redis for 10 minutes
+    pending_key = f"pending_user:{user.email}"
+    pending_data = user.dict()
+    redis_client.setex(pending_key, 600, json.dumps(pending_data))
+    
+    # Store OTP in Redis for 10 minutes
+    otp_key = f"otp:{user.email}"
+    redis_client.setex(otp_key, 600, otp)
+    
+    # Send OTP Email
+    email_sent = await mail_handler.send_otp_email(user.email, otp)
+    
+    if not email_sent:
+        # If it's a local environment with no SMTP, we might want to log it for testing
+        if os.getenv("ENVIRONMENT") != "production":
+            print(f"🚩 [DEV ONLY] OTP for {user.email} is: {otp}")
+        else:
+            raise HTTPException(status_code=500, detail="Failed to send verification email. Please try again later.")
+
+    return {
+        "message": "Verification code sent to your email.",
+        "email": user.email,
+        "is_verifying": True
+    }
+
+@app.post("/auth/verify-otp")
+async def verify_otp(response: Response, data: dict):
+    from db import redis_client
+    email = data.get("email")
+    otp_provided = data.get("otp")
+    
+    if not email or not otp_provided:
+        raise HTTPException(status_code=400, detail="Email and OTP are required")
+        
+    # Check OTP in Redis
+    stored_otp = redis_client.get(f"otp:{email}")
+    if isinstance(stored_otp, bytes): stored_otp = stored_otp.decode('utf-8')
+    
+    if not stored_otp or stored_otp != otp_provided:
+        # For development/debugging
+        print(f"DEBUG: Stored OTP for {email} is {stored_otp}, provided was {otp_provided}")
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+        
+    # Validation successful -> Finalize User Creation
+    pending_key = f"pending_user:{email}"
+    user_data_raw = redis_client.get(pending_key)
+    if not user_data_raw:
+        raise HTTPException(status_code=400, detail="Registration session expired. Please sign up again.")
+    
+    if isinstance(user_data_raw, bytes): user_data_raw = user_data_raw.decode('utf-8')
+    user_data = json.loads(user_data_raw)
+    
+    # Map back to User object for create_user
+    new_user = User(**user_data)
+    create_user(new_user)
+    
+    # Cleanup Redis
+    redis_client.delete(f"otp:{email}")
+    redis_client.delete(pending_key)
+    
+    # Issue Access Token
+    token = create_access_token({"sub": email})
+    response.set_cookie(
+        key="access_token", 
+        value=token, 
+        httponly=True, 
+        max_age=10*24*3600, 
+        samesite=COOKIE_SAMESITE, 
+        secure=COOKIE_SECURE
+    )
+    
+    return {"message": "Email verified successfully", "access_token": token}
+
+@app.post("/auth/login")
+async def login(request: Request, response: Response, user: User):
+    from db import rate_limit_check
+    if not rate_limit_check(user.email, limit=10, period_hours=1):
+        raise HTTPException(status_code=429, detail="Too many login attempts. Please try again later.")
+        
+    db_user = get_user_by_email(user.email)
+    if not db_user or not verify_password(user.password, db_user['password']):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    token = create_access_token({"sub": user.email})
+    response.set_cookie(
+        key="access_token", 
+        value=token, 
+        httponly=True, 
+        max_age=10*24*3600, 
+        samesite=COOKIE_SAMESITE, 
+        secure=COOKIE_SECURE
+    )
+    return {"access_token": token}
+
+@app.post("/auth/logout")
+async def logout(response: Response):
+    response.delete_cookie(
+        key="access_token", 
+        httponly=True, 
+        samesite=COOKIE_SAMESITE, 
+        secure=COOKIE_SECURE,
+        path="/"
+    )
+    return {"message": "Logged out successfully"}
+
+@app.post("/auth/google")
+async def google_login(response: Response, data: dict):
+    token = data.get("token")
+    access_token = data.get("access_token")
+    
+    idinfo = None
+    if token:
+        idinfo = verify_google_token(token)
+    elif access_token:
+        idinfo = verify_google_access_token(access_token)
+        
+    if not idinfo:
+        raise HTTPException(status_code=401, detail="Invalid Google token")
+    
+    email = idinfo['email']
+    name = idinfo.get('name', email.split('@')[0])
+    
+    db_user = get_user_by_email(email)
+    if not db_user:
+        # Create user if doesn't exist (random password since they use Google)
+        db_user = create_user(User(username=name, email=email, password=str(uuid.uuid4())))
+    
+    access_token = create_access_token({"sub": email})
+    response.set_cookie(
+        key="access_token", 
+        value=access_token, 
+        httponly=True, 
+        max_age=10*24*3600, 
+        samesite=COOKIE_SAMESITE, 
+        secure=COOKIE_SECURE
+    )
+    return {"access_token": access_token}
+
+@app.post("/auth/forgot-password")
+async def forgot_password(data: dict):
+    email = data.get("email")
+    user = get_user_by_email(email)
+    if not user:
+        # Security best practice: don't reveal if user exists
+        return {"message": "If this email is registered, you will receive a reset link."}
+    
+    token = create_password_reset_token(email)
+    # Mocking email send
+    print(f"DEBUG: Password reset link for {email}: http://localhost:5173/reset-password?token={token}")
+    return {"message": "Reset link generated (check server console for debug link)"}
+
+@app.post("/auth/reset-password")
+async def reset_password(data: dict):
+    token = data.get("token")
+    new_password = data.get("new_password")
+    
+    email = get_email_from_reset_token(token)
+    if not email:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+    
+    user_data = get_user_by_email(email)
+    if user_data:
+        user_data['password'] = get_password_hash(new_password)
+        from db import redis_client
+        from db import redis_client
+        redis_client.set(f"user:{email}", json.dumps(user_data))
+        delete_reset_token(token)
+        return {"message": "Password reset successfully"}
+    
+    raise HTTPException(status_code=404, detail="User not found")
+
+# Dependency for getting current user from secure cookie or Authorization header
+def get_current_user(request: Request):
+    token = None
+    
+    # Debug: Log incoming headers (be careful not to log sensitive data in real production)
+    auth_header = request.headers.get("Authorization")
+    print(f"🔍 [AUTH DEBUG] Request to {request.url.path} | Auth Header Present: {bool(auth_header)}")
+    
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ")[1]
+    
+    if not token:
+        token = request.cookies.get("access_token")
+        if token:
+            print("🍪 [AUTH DEBUG] Fallback to cookie auth")
+        
+    if not token:
+        print("[ERROR] [AUTH DEBUG] No token found in headers or cookies")
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    try:
+        payload = decode_access_token(token)
+        if not payload or not payload.get("sub"):
+            raise HTTPException(status_code=401, detail="Invalid session")
+        return payload.get("sub")
+    except Exception as e:
+        print(f"⚠️ [AUTH DEBUG] Token validation failed: {str(e)}")
+        raise HTTPException(status_code=401, detail="Session validation failed")
+
+@app.get("/auth/status")
+async def get_auth_status(request: Request):
+    try:
+        user = get_current_user(request)
+        return {"authenticated": True, "user": user}
+    except HTTPException:
+        return {"authenticated": False}
+
+from fastapi import BackgroundTasks
+
+@app.get("/workspace/init")
+async def init_workspace(user: str = Depends(get_current_user)):
+    from db import get_user_documents, get_user_sessions, user_has_documents
+    from auth import get_user_by_email
+    
+    # Fetch all critical data in parallel/sequence for unified dispatch
+    profile = get_user_by_email(user)
+    docs = get_user_documents(user)
+    sessions = get_user_sessions(user)
+    has_docs = user_has_documents(user)
+    
+    return {
+        "user_profile": {
+            "username": profile.get("username") if profile else user,
+            "email": profile.get("email") if profile else user,
+            "profile_pic": profile.get("profile_pic", "") if profile else ""
+        },
+        "sessions": sessions,
+        "documents": docs,
+        "status": {
+            "authenticated": True,
+            "has_documents": has_docs
+        }
+    }
+
+@app.get("/user/documents")
+async def list_documents(user: str = Depends(get_current_user)):
+    from db import get_user_documents
+    return get_user_documents(user)
+
+@app.delete("/chats/{session_id}")
+async def remove_session(session_id: str, user: str = Depends(get_current_user)):
+    from db import delete_session
+    from rag import delete_vector_data
+    
+    # 1. Wipe Redis (Meta, History, Registry) and get document names
+    doc_names = delete_session(user, session_id)
+    
+    # 2. Wipe Qdrant Vectors if documents were found
+    if doc_names:
+        delete_vector_data(user, doc_names)
+        
+    return {"status": "success", "message": "Analysis purged from all neural layers."}
+
+@app.post("/upload")
+async def upload_document(
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(...),
+    user: str = Depends(get_current_user)
+):
+    from rag import extract_text_from_pdf, extract_text_from_docx, validate_domain_keywords, ingest_document
+    from agents import energy_agent
+    from db import register_document, create_session, redis_client
+    import os
+    import shutil
+    import uuid
+    import tempfile
+
+    all_registered = []
+    first_text = ""
+    
+    # 0. Global Size Check (Safety limit: 25MB total per request)
+    MAX_FILE_SIZE = 25 * 1024 * 1024
+    
+    for file in files:
+        # Check individual file size
+        file.file.seek(0, 2)
+        size = file.file.tell()
+        file.file.seek(0)
+        if size > MAX_FILE_SIZE:
+             raise HTTPException(status_code=413, detail=f"File {file.filename} exceeds the 25MB limit.")
+
+        suffix = os.path.splitext(file.filename)[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+        
+        try:
+            # 1. Quick Extract for Validation
+            text = ""
+            if file.filename.lower().endswith('.pdf'):
+                text = extract_text_from_pdf(tmp_path)
+            elif file.filename.lower().endswith(('.docx', '.doc')):
+                text = extract_text_from_docx(tmp_path)
+            
+            if not text.strip():
+                os.remove(tmp_path)
+                raise HTTPException(status_code=400, detail=f"File {file.filename} appears to be a scanned image or empty. Please use a text-based PDF.")
+
+            if not validate_domain_keywords(text):
+                os.remove(tmp_path)
+                raise HTTPException(status_code=400, detail=f"File {file.filename} is not a valid Energy document. Only technical energy data is allowed.")
+
+            # Stage 2: AI Contextual Validation (Gatekeeper)
+            # Use the first 2000 characters for a deep contextual check
+            ai_verdict = energy_agent.verify_document_domain(text)
+            if not ai_verdict.get("is_energy_related", True):
+                os.remove(tmp_path)
+                rejection_reason = ai_verdict.get("reasoning", "Document context does not align with technical energy data.")
+                raise HTTPException(status_code=400, detail=f"AI Rejection: {file.filename} was rejected. Reason: {rejection_reason}")
+
+            if not first_text:
+                first_text = text
+            
+            print(f"[DEBUG] Document validation passed. Triggering AI Insight... (Text length: {len(first_text)})")
+            insight = energy_agent.generate_document_insight(first_text)
+            print(f"[DEBUG] AI Insight generated: {bool(insight)}")
+            
+            # 2. Register & Queue
+            doc_id = str(uuid.uuid4())
+            doc_info = register_document(user, file.filename, doc_id)
+            all_registered.append(doc_id)
+            background_tasks.add_task(ingest_document, tmp_path, user, file.filename)
+            
+        except Exception as e:
+            print(f"Error processing {file.filename}: {e}")
+            try:
+                if 'tmp_path' in locals() and os.path.exists(tmp_path): 
+                    os.remove(tmp_path)
+            except: pass
+
+    if not all_registered:
+        raise HTTPException(status_code=400, detail="No valid energy documents found in upload.")
+
+    # 3. Create Session for this Batch
+    title = f"Analysis: {files[0].filename}" if len(files) == 1 else f"Batch Analysis ({len(files)} docs)"
+    session = create_session(user, title, all_registered)
+
+    # 4. Generate AI Insight (Summary + Questions)
+    insight = energy_agent.generate_document_insight(first_text)
+    
+    # Store initial AI message in history
+    intro_content = f"### Technical Summary\n{insight['summary']}\n\n**Suggested Investigations:**\n" + \
+                    "\n".join([f"- {q}" for q in insight['suggested_questions']])
+    
+    # Set TTL using Global Retention Policy (User Scoped Key)
+    from db import RETENTION_SECONDS
+    history_key = f"chat_history:{user}:{session['id']}"
+    redis_client.setex(history_key, RETENTION_SECONDS, json.dumps([{"role": "ai", "content": intro_content}]))
+
+    return {
+        "message": "Analysis initiated", 
+        "session_id": session["id"],
+        "insight": insight
+    }
+        
+# --- CHAT SESSIONS ---
+
+@app.get("/chats")
+async def list_chats(user: str = Depends(get_current_user)):
+    from db import get_user_sessions
+    return get_user_sessions(user)
+
+@app.get("/chat/history")
+async def get_history(session_id: str, user: str = Depends(get_current_user)):
+    from db import redis_client
+    from db import redis_client
+    
+    # SECURITY: Verify that the session_id belongs to this user before fetching
+    user_sessions = redis_client.smembers(f"user_sessions:{user}")
+    if session_id not in user_sessions:
+        raise HTTPException(status_code=403, detail="Unauthorized access to this session's history")
+
+    history_key = f"chat_history:{user}:{session_id}"
+    history_raw = redis_client.get(history_key)
+    if not history_raw:
+        return []
+        
+    try:
+        if isinstance(history_raw, bytes): history_raw = history_raw.decode('utf-8')
+        return json.loads(history_raw)
+    except:
+        # Aggressively recover old text-based history by splitting merged strings
+        messages = []
+        parts = str(history_raw).split("\n")
+        
+        for p in parts:
+            if not p.strip(): continue
+            
+            # Robust split: Find "User: " anywhere in the line
+            if "User: " in p:
+                u_parts = p.split("User: ")
+                if u_parts[0].strip():
+                    if messages and messages[-1]["role"] == "ai":
+                        messages[-1]["content"] += "\n" + u_parts[0].strip()
+                    else:
+                        messages.append({"role": "ai", "content": u_parts[0].strip()})
+                
+                # Append the fresh user message if text is present after "User: "
+                if len(u_parts) > 1 and u_parts[1].strip():
+                    messages.append({"role": "user", "content": u_parts[1].strip()})
+                continue
+
+            if p.startswith("AI: "):
+                messages.append({"role": "ai", "content": p[4:]})
+            else:
+                if messages and messages[-1]["role"] == "ai":
+                    messages[-1]["content"] += "\n" + p
+                else:
+                    messages.append({"role": "ai", "content": p})
+        return messages
+
+@app.post("/chats/new")
+async def new_chat(user: str = Depends(get_current_user)):
+    from db import create_session
+    return create_session(user)
+
+@app.get("/user/status")
+async def get_user_status(user: str = Depends(get_current_user)):
+    from db import user_has_documents
+    from auth import get_user_by_email
+    
+    db_user = get_user_by_email(user)
+    has_docs = user_has_documents(user)
+    
+    return {
+        "authenticated": True,
+        "username": db_user.get("username") if db_user else user,
+        "has_documents": has_docs
+    }
+
+    return {"message": "Workspace cleared", "purged_docs": doc_names}
+
+@app.patch("/chats/{session_id}/title")
+async def rename_chat(session_id: str, request: Request, user: str = Depends(get_current_user)):
+    from db import update_session_title
+    data = await request.json()
+    new_title = data.get("title")
+    if not new_title:
+        raise HTTPException(status_code=400, detail="Title is required")
+    
+    # Trim title if too long
+    if len(new_title) > 60:
+        new_title = new_title[:57] + "..."
+    
+    success = update_session_title(user, session_id, new_title)
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    return {"message": "Session renamed", "new_title": new_title}
+
+# --- USER PROFILE ---
+
+@app.get("/user/profile")
+async def get_profile(user: str = Depends(get_current_user)):
+    from auth import get_user_by_email
+    data = get_user_by_email(user)
+    if not data:
+        raise HTTPException(status_code=404, detail="User not found")
+    # Return profile without sensitive data
+    return {
+        "username": data.get("username"),
+        "email": data.get("email"),
+        "profile_pic": data.get("profile_pic", "")
+    }
+
+@app.post("/user/profile")
+async def update_profile(request: Request, user: str = Depends(get_current_user)):
+    from auth import get_user_by_email
+    from db import redis_client
+    
+    data = await request.json()
+    db_user = get_user_by_email(user)
+    
+    if db_user:
+        if "username" in data:
+            db_user["username"] = data["username"]
+        if "profile_pic" in data:
+            db_user["profile_pic"] = data["profile_pic"]
+            
+        redis_client.set(f"user:{user}", json.dumps(db_user))
+        return {
+            "username": db_user["username"],
+            "profile_pic": db_user.get("profile_pic", "")
+        }
+    
+    raise HTTPException(status_code=404, detail="User not found")
+
+@app.post("/chat")
+async def chat(request: Request, user: str = Depends(get_current_user)):
+    from rag import retrieve_and_rerank, generate_response
+    from db import rate_limit_check, cache_get, cache_set
+    
+    if not rate_limit_check(user):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. 15 chats per 4 hours.")
+        
+    data = await request.json()
+    query = data.get("query")
+    doc_name = data.get("doc_name")
+    session_id = data.get("session_id") # New session support
+    
+    # Setup History Key (User Scoped)
+    from db import RETENTION_SECONDS, redis_client
+    history_key = f"chat_history:{user}:{session_id}" if session_id else f"chat_history:{user}"
+
+    # Check Cache
+    cache_key = f"cache:{user}:{query}"
+    cached = cache_get(cache_key)
+    if cached:
+        # Save Cached hit to history as well (JSON STYLE)
+        hist_raw = redis_client.get(history_key) or "[]"
+        if isinstance(hist_raw, bytes): hist_raw = hist_raw.decode('utf-8')
+        try:
+            hist_list = json.loads(hist_raw)
+        except:
+            hist_list = []
+        
+        hist_list.append({"role": "user", "content": query})
+        hist_list.append({"role": "ai", "content": cached})
+        redis_client.setex(history_key, RETENTION_SECONDS, json.dumps(hist_list[-50:]))
+        return {"response": cached, "type": "cache"}
+    
+    # 1. RETRIEVAL & RERANKING
+    chunks = retrieve_and_rerank(query, user, doc_name)
+    
+    # 2. DECIDE: RAG vs AGENTS (Smart Fallback)
+    # If the best score is less than 0.55, we consider it a miss for specific manual retrieval
+    best_score = max([c['score'] for c in chunks]) if chunks else 0
+    use_agents = best_score < 0.55
+    
+    if use_agents:
+        print(f"🕵️ [FALLBACK] No strong matches in manual (Best Score: {best_score}). Triggering Web Agents...")
+        async def agent_stream_generator():
+            yield "[STATUS]: Activating Autonomous Research Agents. No direct matches found in your manuals.\n\n"
+            try:
+                # 3. RUN AGENTIC RESEARCH (Project 2 Logic)
+                agent_result = await run_full_research(query, thread_id=session_id or "default")
+                report = agent_result.get("report", "Research agents failed to find information.")
+                suggestions = agent_result.get("suggestions", [])
+                
+                # Format with Suggestions for Frontend
+                metadata_payload = json.dumps({"chunks": [], "is_agentic": True, "suggestions": suggestions})
+                yield f"[METADATA]: {metadata_payload}\n\n"
+                yield report
+                
+                # PERSISTENCE: Save Agent Report to history
+                from db import redis_client, RETENTION_SECONDS
+                history_key = f"chat_history:{user}:{session_id}" if session_id else f"chat_history:{user}"
+                hist_raw = redis_client.get(history_key) or "[]"
+                if isinstance(hist_raw, bytes): hist_raw = hist_raw.decode('utf-8')
+                hist_list = json.loads(hist_raw)
+                hist_list.append({"role": "user", "content": query})
+                hist_list.append({"role": "ai", "content": report})
+                redis_client.setex(history_key, RETENTION_SECONDS, json.dumps(hist_list[-50:]))
+                
+            except Exception as e:
+                yield f"Error in research agents: {str(e)}"
+        
+        return StreamingResponse(agent_stream_generator(), media_type="text/event-stream")
+
+    # 3. GENERATION (STREAMING) - STANDARD RAG
+    response_data = generate_response(query, chunks, user, session_id)
+    
+    # EARLY PERSISTENCE: Save the user question immediately so it's not lost on refresh
+    hist_raw = redis_client.get(history_key) or "[]"
+    if isinstance(hist_raw, bytes): hist_raw = hist_raw.decode('utf-8')
+    try:
+        hist_list = json.loads(hist_raw)
+    except:
+        hist_list = []
+    
+    # Check if question already present (to avoid duplicates on error retries/refreshes)
+    if not (hist_list and hist_list[-1].get("role") == "user" and hist_list[-1].get("content") == query):
+        hist_list.append({"role": "user", "content": query})
+        redis_client.setex(history_key, RETENTION_SECONDS, json.dumps(hist_list[-50:]))
+    
+    async def stream_generator():
+        # 1. Send Chunks Metadata for UI Trace
+        metadata_payload = json.dumps({"chunks": chunks})
+        yield f"[METADATA]: {metadata_payload}\n\n"
+
+        if isinstance(response_data, str):
+            # Save User + Error to history (JSON STYLE)
+            hist_raw = redis_client.get(history_key) or "[]"
+            if isinstance(hist_raw, bytes): hist_raw = hist_raw.decode('utf-8')
+            try:
+                hist_list = json.loads(hist_raw)
+            except:
+                hist_list = []
+            
+            hist_list.append({"role": "ai", "content": response_data})
+            redis_client.setex(history_key, RETENTION_SECONDS, json.dumps(hist_list[-50:]))
+            yield response_data
+            return
+
+        full_text = ""
+        for chunk in response_data:
+            if chunk.choices[0].delta.content is not None:
+                content = chunk.choices[0].delta.content
+                full_text += content
+                yield content
+        
+        # FINAL COMMIT: Save only the AI response (User was saved early)
+        cache_set(cache_key, full_text)
+        hist_raw = redis_client.get(history_key) or "[]"
+        if isinstance(hist_raw, bytes): hist_raw = hist_raw.decode('utf-8')
+        try:
+            hist_list = json.loads(hist_raw)
+        except:
+            hist_list = []
+        
+        hist_list.append({"role": "ai", "content": full_text})
+        redis_client.setex(history_key, RETENTION_SECONDS, json.dumps(hist_list[-50:]))
+                
+    return StreamingResponse(stream_generator(), media_type="text/event-stream")
