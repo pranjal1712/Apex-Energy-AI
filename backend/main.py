@@ -50,6 +50,10 @@ app.add_middleware(
     expose_headers=["*"]
 )
 
+@app.get("/")
+async def health_check():
+    return {"status": "healthy", "service": "Apex Energy AI"}
+
 @app.on_event("startup")
 def startup_event():
     import threading
