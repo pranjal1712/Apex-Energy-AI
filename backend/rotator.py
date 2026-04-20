@@ -14,18 +14,20 @@ class APIKeyRotator:
             self.keys.append(key)
             i += 1
             
-        if not self.keys:
-            # Fallback to single key if numbered keys aren't found
-            single_key = os.getenv(env_prefix)
-            if single_key:
-                # Support comma-separated keys in a single env variable
-                if "," in single_key:
+        # Support both singular (GROQ_API_KEY) and plural (GROQ_API_KEYS)
+        for prefix in [env_prefix, f"{env_prefix}S"]:
+            val = os.getenv(prefix)
+            if val:
+                if "," in val:
                     # Strip spaces AND quotes (' or ") for cloud environment robustness
-                    self.keys.extend([k.strip().strip("'").strip('"') for k in single_key.split(",") if k.strip() and not k.startswith("your-")])
+                    self.keys.extend([k.strip().strip("'").strip('"') for k in val.split(",") if k.strip() and not k.startswith("your-")])
                 else:
-                    clean_key = single_key.strip().strip("'").strip('"')
+                    clean_key = val.strip().strip("'").strip('"')
                     if not clean_key.startswith("your-"):
                         self.keys.append(clean_key)
+        
+        # Deduplicate keys to avoid redundant attempts
+        self.keys = list(dict.fromkeys(self.keys))
             
         print(f"[ROTATOR] Initialized {env_prefix} with {len(self.keys)} active keys.")
 
