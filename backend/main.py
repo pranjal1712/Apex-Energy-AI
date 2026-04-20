@@ -1,8 +1,10 @@
 from dotenv import load_dotenv
 import os
 import json
-# Load environment variables from the root .env file
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
+# Load environment variables from the root .env file if it exists (local development)
+DOTENV_PATH = os.path.join(os.path.dirname(__file__), "..", ".env")
+if os.path.exists(DOTENV_PATH):
+    load_dotenv(dotenv_path=DOTENV_PATH)
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Response, Request
 from fastapi.responses import StreamingResponse

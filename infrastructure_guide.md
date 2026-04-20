@@ -18,6 +18,7 @@ Add these **Inbound Rules** to your instance's Security Group:
 | HTTP | 80 | TCP | 0.0.0.0/0 | Frontend Access |
 | HTTPS | 443 | TCP | 0.0.0.0/0 | Secure Access |
 | API | 8000 | TCP | 0.0.0.0/0 | Backend API (Direct Access) |
+| K8s API | 6443 | TCP | 0.0.0.0/0 | Kubernetes Remote Orchestration |
 
 ---
 

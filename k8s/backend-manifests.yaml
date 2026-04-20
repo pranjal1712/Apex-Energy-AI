@@ -46,16 +46,43 @@ spec:
             secretKeyRef:
               name: apex-secrets
               key: QDRANT_API_KEY
+        - name: TAVILY_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: apex-secrets
+              key: TAVILY_API_KEY
+        - name: GROQ_API_KEYS
+          valueFrom:
+            secretKeyRef:
+              name: apex-secrets
+              key: GROQ_API_KEYS
+        - name: MAIL_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: apex-secrets
+              key: MAIL_USERNAME
+        - name: MAIL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: apex-secrets
+              key: MAIL_PASSWORD
+        - name: MAIL_FROM
+          valueFrom:
+            secretKeyRef:
+              name: apex-secrets
+              key: MAIL_FROM
+        - name: ENVIRONMENT
+          value: "production"
         - name: PORT
           value: "8000"
         - name: DEBUG
           value: "False"
         resources:
           limits:
-            memory: "512Mi"
+            memory: "1Gi"
             cpu: "500m"
           requests:
-            memory: "256Mi"
+            memory: "512Mi"
             cpu: "250m"
         livenessProbe:
           httpGet:
