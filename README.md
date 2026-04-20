@@ -34,7 +34,7 @@ Apex Energy AI is built on a state-of-the-art stack optimized for real-time inte
 - **Frontend**: `React 18`, `Vite`, `Vanilla CSS & Tailwind`, `Lucide Icons`.
 - **Backend**: `FastAPI` (Python 3.11), `JWT Auth`, `FastAPI-Mail` (Verification Hub).
 - **AI Engine**: `Groq` (Llama-3.1), `SentenceTransformers` (Neural Embeddings), `LangChain`.
-- **Infrastructure**: `Qdrant` (Vector Store), `Redis` (Atomic Chat Memory), `Docker` Ready.
+- **Infrastructure**: `Qdrant` (Vector Store), `Redis` (Atomic Chat Memory), `Docker` & `Kubernetes` Orchestrated.
 
 ---
 
@@ -116,6 +116,33 @@ Add the following secrets to your GitHub Repository (**Settings > Secrets and va
 - `EC2_HOST`: The Public IP of your EC2 instance.
 - `EC2_SSH_KEY`: Your `.pem` file content.
 - `VITE_GOOGLE_CLIENT_ID`: Your Google OAuth Client ID.
+
+---
+
+## ☸️ Kubernetes Orchestration (Scaling & High Availability)
+
+For large-scale production, Apex Energy AI is ready for Kubernetes deployment.
+
+### 1. Structure
+All manifests are located in the `k8s/` directory:
+- `namespace.yaml`: Segregated environment (`apex-energy`).
+- `secrets.yaml`: Template for secure environment variable management.
+- `backend-manifests.yaml`: Deployment and ClusterIP service for the API.
+- `frontend-manifests.yaml`: Deployment and LoadBalancer service for the UI.
+
+### 2. Manual Deployment
+```bash
+kubectl apply -f k8s/namespace.yaml
+# Update k8s/secrets.yaml with base64 encoded values, then:
+kubectl apply -f k8s/secrets.yaml
+kubectl apply -f k8s/backend-manifests.yaml
+kubectl apply -f k8s/frontend-manifests.yaml
+```
+
+### 3. CI/CD with Kubernetes
+The project includes a dedicated `.github/workflows/k8s-deploy.yml` workflow. To activate it:
+1. Add `KUBECONFIG` content as a GitHub Secret.
+2. The pipeline will automatically build images, push to Docker Hub, and update your K8s cluster on every push to `main`.
 
 ---
 
