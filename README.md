@@ -146,6 +146,15 @@ The project includes a dedicated `.github/workflows/k8s-deploy.yml` workflow. To
 
 ---
 
+## 🔧 IDE Troubleshooting (Red Squiggles)
+
+If you see "Unable to resolve action" warnings in VS Code:
+1.  **Trust Workspace:** Ensure you have clicked "Trust Workspace" when opening the project.
+2.  **Login:** Click the "Accounts" icon in the bottom-left and **Sign in to GitHub**.
+3.  **Settings:** The project includes a `.vscode/settings.json` that automates these fixes. If they persist, run `Developer: Reload Window` from the Command Palette (`Ctrl+Shift+P`).
+
+---
+
 ## 📜 License
 
 This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
