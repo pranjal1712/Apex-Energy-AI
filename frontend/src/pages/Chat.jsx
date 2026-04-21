@@ -313,16 +313,16 @@ export default function Chat({ userProfile: propProfile, initialSessions, initia
   };
 
   const handleSend = async () => {
-    if (!input.trim()) return;
+    const query = input.trim();
+    if (!query) return;
 
-    const queryForTitle = input;
-    const userMsg = { role: 'user', content: queryForTitle };
+    const userMsg = { role: 'user', content: query };
     setMessages(prev => [...prev, userMsg]);
     setInput('');
 
     // Auto-rename session on first message to reflect the user's question
     if (messages.length === 0 && activeSession?.title === "New Analysis") {
-      const newTitle = queryForTitle.length > 50 ? queryForTitle.substring(0, 47) + "..." : queryForTitle;
+      const newTitle = query.length > 50 ? query.substring(0, 47) + "..." : query;
       apiFetch(`/chats/${activeSession.id}/title`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -342,7 +342,7 @@ export default function Chat({ userProfile: propProfile, initialSessions, initia
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          query: input,
+          query: query,
           session_id: activeSession?.id
         })
       });
@@ -373,24 +373,23 @@ export default function Chat({ userProfile: propProfile, initialSessions, initia
         const { value, done: readerDone } = await reader.read();
         done = readerDone;
         if (value) {
-          const chunkText = decoder.decode(value, { stream: true });
+          let chunkText = decoder.decode(value, { stream: true });
 
-          // Handle Agentic Status Signals
+          // 🛡️ Robust Multi-part Parser: Handle [STATUS], [METADATA] and text in one chunk
           if (chunkText.includes('[STATUS]:')) {
             const statusMatch = chunkText.match(/\[STATUS\]: (.*?)\n\n/);
             if (statusMatch) {
               setSearchStatus(`🔍 ${statusMatch[1]}`);
-              setIsLoading(true); // Keep thinking bubble alive
-              continue;
+              setIsLoading(true);
+              chunkText = chunkText.replace(statusMatch[0], ''); // Remove status from content
             }
           }
 
           if (chunkText.includes('[METADATA]:')) {
-            try {
-              const parts = chunkText.split('\n\n');
-              const metaPart = parts.find(p => p.startsWith('[METADATA]:'));
-              if (metaPart) {
-                const metadata = JSON.parse(metaPart.replace('[METADATA]: ', ''));
+            const metaMatch = chunkText.match(/\[METADATA\]: (.*?)\n\n/);
+            if (metaMatch) {
+              try {
+                const metadata = JSON.parse(metaMatch[1]);
                 setMessages(prev => {
                   const next = [...prev];
                   next[next.length - 1] = { 
@@ -401,34 +400,27 @@ export default function Chat({ userProfile: propProfile, initialSessions, initia
                   };
                   return next;
                 });
-                const bodyText = parts.filter(p => !p.startsWith('[METADATA]:') && !p.startsWith('[STATUS]:')).join('\n\n');
-                if (bodyText) {
-                  accumulatedContent += bodyText;
-                  setMessages(prev => {
-                    const next = [...prev];
-                    next[next.length - 1] = { ...next[next.length - 1], content: accumulatedContent };
-                    return next;
-                  });
-                }
-                continue;
+                chunkText = chunkText.replace(metaMatch[0], ''); // Remove metadata from content
+              } catch (e) {
+                console.error("Metadata parse error:", e);
               }
-            } catch (e) { console.error(e); }
+            }
           }
 
-          accumulatedContent += chunkText;
-          setMessages(prev => {
-            const next = [...prev];
-            const lastMessage = next[next.length - 1];
-            next[next.length - 1] = { 
-              ...lastMessage, 
-              content: accumulatedContent,
-              isStreaming: true 
-            };
-            return next;
-          });
-          
-          // If we are getting content, we are no longer "searching"
-          setIsLoading(false);
+          if (chunkText.length > 0) {
+            accumulatedContent += chunkText;
+            setMessages(prev => {
+              const next = [...prev];
+              const lastMessage = next[next.length - 1];
+              next[next.length - 1] = { 
+                ...lastMessage, 
+                content: accumulatedContent,
+                isStreaming: true 
+              };
+              return next;
+            });
+            setIsLoading(false); // Content arrived -> Hide bubble
+          }
         }
       }
 
@@ -587,7 +579,7 @@ export default function Chat({ userProfile: propProfile, initialSessions, initia
                   {msg.role === 'ai' ? (
                     <>
                       <TypedMarkdown
-                        key={`${i}-${msg.content.length}`}
+                        key={`ai-msg-${i}`}
                         content={msg.content}
                         isStreaming={msg.isStreaming}
                         animate={msg.isNew}
