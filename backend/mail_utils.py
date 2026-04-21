@@ -51,7 +51,7 @@ class MailHandler:
         """
         
         message = MessageSchema(
-            subject="Enerlytics AI - Verification Code Required",
+            subject="Apex Energy AI - Verification Code Required",
             recipients=[email_to],
             body=html,
             subtype=MessageType.html,
