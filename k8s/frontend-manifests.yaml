@@ -18,6 +18,7 @@ spec:
       containers:
       - name: frontend
         image: pranjal1712/apex-energy-frontend:latest
+        imagePullPolicy: Always
         ports:
         - containerPort: 80
         resources:

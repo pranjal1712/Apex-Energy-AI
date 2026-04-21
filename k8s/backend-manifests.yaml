@@ -18,6 +18,7 @@ spec:
       containers:
       - name: backend
         image: pranjal1712/apex-energy-backend:latest
+        imagePullPolicy: Always
         ports:
         - containerPort: 8000
         env:
