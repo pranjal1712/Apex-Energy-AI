@@ -822,23 +822,6 @@ body {
   }
 }
 
-/* --- LOGO BRANDING Fix --- */
-.logo-brand-container {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: white;
-  border-radius: 8px;
-  overflow: hidden;
-  box-shadow: 0 0 15px rgba(255, 255, 255, 0.2);
-}
-
-.logo-brand-img {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-}
-
 /* --- DASHBOARD LAYOUT [NEW] --- */
 .dashboard-layout {
   display: grid;
